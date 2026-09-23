@@ -52,6 +52,103 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Generic download relay ──────────────────────────────────────────────────
+# Some resolved download_url values (Wootly/Goojara mirrors, and likely others)
+# come back signed per-requester — they 403 no matter what Referer/User-Agent
+# a client sends, which points to the signature being bound to the IP that
+# originally requested it from the upstream (this server's own outbound IP,
+# since /pb/stream resolved it server-side). A client-facing redirect to that
+# raw URL can never work for an end user on a different IP.
+#
+# This proxies the fetch through the same server/IP that resolved the link in
+# the first place, and streams the response back — same low-memory pattern as
+# /music/stream/{token} above, generalized to an arbitrary upstream URL
+# instead of a JioSaavn-specific one, with Range/HEAD support preserved so
+# browsers and download managers can still seek/resume.
+#
+# SECURITY: only relays to https:// URLs that were themselves just returned
+# by this API's own resolvers (pb/mb/fk/etc.) in the same request/response
+# cycle — this is not an open proxy. Callers should treat `url` as opaque
+# and pass through exactly what /pb/stream (or similar) gave them, not user-
+# supplied input.
+@app.api_route("/dl/relay", methods=["GET", "HEAD"], tags=["Downloader"])
+async def dl_relay(request: Request, url: str = Query(..., min_length=8)):
+    if not url.startswith("https://"):
+        raise HTTPException(400, "url must be https://")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    range_h = request.headers.get("range")
+    if range_h:
+        headers["Range"] = range_h
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+    try:
+        if request.method == "HEAD":
+            upstream = await client.head(url, headers=headers)
+            out_headers = {
+                "cache-control": "no-store",
+                "access-control-allow-origin": "*",
+                "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges, Content-Disposition",
+                "accept-ranges": upstream.headers.get("accept-ranges") or "bytes",
+            }
+            for k in ("content-type", "content-length", "content-range", "content-disposition"):
+                if k in upstream.headers:
+                    out_headers[k] = upstream.headers[k]
+            media = (upstream.headers.get("content-type") or "application/octet-stream").split(";")[0]
+            await client.aclose()
+            return Response(status_code=upstream.status_code, headers=out_headers, media_type=media)
+
+        req = client.build_request("GET", url, headers=headers)
+        upstream = await client.send(req, stream=True)
+        if upstream.status_code >= 400:
+            body_preview = b""
+            try:
+                body_preview = await upstream.aread()
+            except Exception:
+                pass
+            await upstream.aclose()
+            await client.aclose()
+            raise HTTPException(
+                upstream.status_code,
+                f"upstream {upstream.status_code}: {body_preview[:200]!r}",
+            )
+
+        out_headers = {
+            "cache-control": "no-store",
+            "access-control-allow-origin": "*",
+            "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges, Content-Disposition",
+            "accept-ranges": upstream.headers.get("accept-ranges") or "bytes",
+        }
+        for k in ("content-type", "content-length", "content-range", "content-disposition"):
+            if k in upstream.headers:
+                out_headers[k] = upstream.headers[k]
+        media = (upstream.headers.get("content-type") or "application/octet-stream").split(";")[0]
+
+        async def body_iter():
+            try:
+                async for chunk in upstream.aiter_bytes(65536):
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            body_iter(),
+            status_code=upstream.status_code,
+            media_type=media,
+            headers=out_headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(502, f"relay failed: {e}")
 
 # =============================================================================
 # HindiAnime (www.hindianime.site) — robust catalog + HLS stream
