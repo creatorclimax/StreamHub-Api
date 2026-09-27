@@ -6413,15 +6413,31 @@ async def mb_proxy_segment(u: str = Query(...), cookie: str = "", referer: str =
     headers = {"User-Agent": _mb_ua, "Referer": ref, "Accept": "*/*"}
     if ck:
         headers["Cookie"] = ck
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        r = await client.get(u, headers=headers)
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, "segment error")
-        return Response(
-            content=r.content,
-            media_type=r.headers.get("content-type") or "application/octet-stream",
-            headers={"Access-Control-Allow-Origin": "*"},
-        )
+    # Streamed rather than r.content -- segments are usually small, but a
+    # misclassified full file (or the init segment of a large asset) used to
+    # get buffered whole into memory here before being sent on, the same
+    # pattern that was producing the multi-hundred-MB single-request spikes.
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+    req = client.build_request("GET", u, headers=headers)
+    r = await client.send(req, stream=True)
+    if r.status_code >= 400:
+        await r.aclose()
+        await client.aclose()
+        raise HTTPException(r.status_code, "segment error")
+
+    async def body_iter():
+        try:
+            async for chunk in r.aiter_bytes(65536):
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        body_iter(),
+        media_type=r.headers.get("content-type") or "application/octet-stream",
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 
 # --- Netplay admin (direct R2 MP4) ---
@@ -6588,7 +6604,6 @@ _mb_ua = "com.community.oneroom/50020119 (Linux; U; Android 13; en_US; 23078RKD5
 _mb_device_id: Optional[str] = None
 _mb_session_token: Optional[str] = None
 _mb_session_lock = asyncio.Lock() if False else None  # set below after asyncio known
-_mb_proxy_cookies: Dict[str, dict] = {}
 
 
 def _mb_md5_hex(data: bytes) -> str:
@@ -6867,10 +6882,6 @@ def _is_dummy_url(url: str) -> bool:
         "upgrade", "notice", "dummy", "placeholder",
         "aa348f2541d13ffe",
     ))
-
-
-def _mb_proxy_remember(mpd_url: str, cookie: str, referer: str):
-    _mb_proxy_cookies[mpd_url] = {"cookie": cookie, "referer": referer, "ts": time.time()}
 
 
 def _parse_mb_play_info(data: dict, ua: str) -> List[dict]:
