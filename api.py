@@ -33,6 +33,7 @@ if BeautifulSoup is None:
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 app = FastAPI(
     title="StreamHub API",
@@ -51,6 +52,73 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Rate limiting ────────────────────────────────────────────────────────
+# This service's own request logs show traffic that doesn't look like real
+# visitors: a near-complete sequential sweep through an entire /24 block
+# (all ~256 addresses, one request each) hitting /health within a couple
+# of minutes, repeated continuously for hours, plus a share of /pb/stream
+# traffic originating from AWS EC2 ranges rather than anything a browser
+# uses. That's consistent with the service being publicly reachable with
+# no auth (ipAllowList 0.0.0.0/0, no API key) and getting hammered by
+# something automated -- inflating real work on /pb/stream (TMDB lookups,
+# scraping, resolution) far past what this site's own visitors would
+# generate, which lines up with the sustained memory growth -> OOM-kill
+# cycle Render's been reporting.
+#
+# A source rotating through many addresses in the same /24 defeats a
+# naive per-IP limit (each address is only ever used once), so this
+# limits by /24 prefix as well as by exact IP. Fixed windows, not
+# sliding, for simplicity -- and the bucket dict is purged on a timer so
+# the limiter's own state can't become the next leak.
+_RATE_LIMIT_WINDOW_S = 60.0
+_RATE_LIMIT_PER_IP = 60
+_RATE_LIMIT_PER_SUBNET24 = 120
+_RATE_CLEANUP_INTERVAL_S = 300.0
+_rate_buckets: Dict[str, List[float]] = {}
+_rate_last_cleanup = [0.0]
+
+
+def _rate_subnet24(ip: str) -> Optional[str]:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return None
+    return f"net:{'.'.join(parts[:3])}.0/24"
+
+
+def _rate_check(key: str, limit: int, now: float) -> bool:
+    bucket = _rate_buckets.get(key)
+    if bucket is None or now - bucket[0] >= _RATE_LIMIT_WINDOW_S:
+        _rate_buckets[key] = [now, 1]
+        return True
+    bucket[1] += 1
+    return bucket[1] <= limit
+
+
+def _rate_cleanup(now: float) -> None:
+    if now - _rate_last_cleanup[0] < _RATE_CLEANUP_INTERVAL_S:
+        return
+    _rate_last_cleanup[0] = now
+    stale = [k for k, v in _rate_buckets.items() if now - v[0] >= _RATE_LIMIT_WINDOW_S]
+    for k in stale:
+        _rate_buckets.pop(k, None)
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        ip = request.client.host if request.client else None
+        if ip:
+            now = time.time()
+            _rate_cleanup(now)
+            ip_ok = _rate_check(f"ip:{ip}", _RATE_LIMIT_PER_IP, now)
+            subnet_key = _rate_subnet24(ip)
+            subnet_ok = subnet_key is None or _rate_check(subnet_key, _RATE_LIMIT_PER_SUBNET24, now)
+            if not ip_ok or not subnet_ok:
+                return JSONResponse({"error": "rate_limited"}, status_code=429, headers={"Retry-After": "30"})
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
 
 # ── Generic download relay ──────────────────────────────────────────────────
 # Some resolved download_url values (Wootly/Goojara mirrors, and likely others)
