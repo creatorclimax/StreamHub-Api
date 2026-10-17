@@ -5086,7 +5086,20 @@ def _ha_embed_servers(tmdb_id: str, is_movie: bool, season: int = 1, episode: in
 # =============================================================================
 
 _VIDSRC_DATA = "https://data.vidsrc.sh/api.php"
+# A wasmtime Engine owns the JIT codegen context and is explicitly meant to
+# be created once and reused -- this was instead being rebuilt (compiling a
+# fresh Module from scratch too) on every single decrypt call, on a hot
+# path called for every /pb/stream resolve that goes through VidSrc. Under
+# concurrent load that's a brand-new JIT engine per in-flight request,
+# which lines up with this service's memory climbing until Render OOM-
+# kills it. _wasm_module_cache already existed but was never actually
+# wired up to anything; it now caches compiled Modules by wasm_url
+# (capped so the cache itself can't grow unbounded as the URL rotates
+# over the service's lifetime), so the same WASM binary isn't recompiled
+# every time the same URL is seen again.
+_WASM_ENGINE = Engine() if _HAS_WASM else None
 _wasm_module_cache: Dict[str, Any] = {}
+_WASM_MODULE_CACHE_MAX = 32
 
 
 def _vidsrc_decrypt_stream_urls(enc_b64: str, wasm_url: str) -> List[str]:
@@ -5096,12 +5109,15 @@ def _vidsrc_decrypt_stream_urls(enc_b64: str, wasm_url: str) -> List[str]:
     try:
         import base64 as _b64
         enc = _b64.b64decode(enc_b64)
-        # fetch wasm
-        with httpx.Client(timeout=20.0, verify=False) as client:
-            wasm_bytes = client.get(wasm_url, headers={"User-Agent": "Mozilla/5.0"}).content
-        engine = Engine()
-        store = Store(engine)
-        module = Module(engine, wasm_bytes)
+        module = _wasm_module_cache.get(wasm_url)
+        if module is None:
+            with httpx.Client(timeout=20.0, verify=False) as client:
+                wasm_bytes = client.get(wasm_url, headers={"User-Agent": "Mozilla/5.0"}).content
+            module = Module(_WASM_ENGINE, wasm_bytes)
+            if len(_wasm_module_cache) >= _WASM_MODULE_CACHE_MAX:
+                _wasm_module_cache.pop(next(iter(_wasm_module_cache)))
+            _wasm_module_cache[wasm_url] = module
+        store = Store(_WASM_ENGINE)
         instance = Instance(store, module, [])
         ex = instance.exports(store)
         alloc = ex["alloc"]
