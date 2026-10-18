@@ -131,13 +131,17 @@ app.add_middleware(RateLimitMiddleware)
 #
 # Rather than let that keep happening on Render's unpredictable schedule --
 # where an OOM kill can land mid-request -- this exits the process on its
-# own timer, safely ahead of the shortest interval observed (~34 min), so
-# Render's existing restart-on-exit behavior (the same mechanism that
-# already brings it back after an OOM kill, confirmed recovering in
-# ~15-30s) recycles it on a predictable cadence instead. This does not fix
-# the underlying leak -- it bounds its damage to a short, controlled
-# restart instead of an unpredictable one.
-_SELF_RESTART_AFTER_S = 20 * 60
+# own timer, so Render's existing restart-on-exit behavior (the same
+# mechanism that already brings it back after an OOM kill, confirmed
+# recovering in ~15-30s) recycles it on a predictable cadence instead.
+# This does not fix the underlying leak -- it bounds its damage to a
+# short, controlled restart instead of an unpredictable one.
+#
+# 20-minute cycles (observed over 2+ hours in production) peaked at only
+# ~150-194MB against the 512MB limit -- well under half, with plenty of
+# margin. 45 minutes keeps that margin comfortable while cutting the
+# restart-triggered "server failure" email frequency roughly in half.
+_SELF_RESTART_AFTER_S = 45 * 60
 
 
 @app.on_event("startup")
