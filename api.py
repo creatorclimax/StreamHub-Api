@@ -8188,6 +8188,20 @@ async def pb_tv_season(tmdb_id: int, season: int):
     return {"ok": True, "tmdb_id": tmdb_id, "season": season, "data": data, "provider": "piratebot"}
 
 
+# The per-IP/subnet rate limiter above doesn't help here: this endpoint's
+# traffic comes from many scattered single-use sources (different cloud
+# ranges, rarely the same IP or /24 twice) that each individually stay well
+# under any per-source cap, yet add up to sustained memory pressure since
+# this handler is the expensive one -- several outbound HTTP calls per
+# request via _pb_get. What actually matters for memory is how much of
+# this work is in flight AT ONCE, not where it's coming from, so this caps
+# concurrent executions directly and rejects (503) once at capacity rather
+# than queuing -- an unbounded queue of waiting coroutines under sustained
+# overload would just become the next version of the same problem.
+_PB_STREAM_MAX_CONCURRENT = 8
+_pb_stream_inflight = [0]
+
+
 @app.get("/pb/stream", tags=["PirateBot"])
 @app.get("/pb/play", tags=["PirateBot"])
 @app.get("/piratebot/stream", tags=["PirateBot"])
@@ -8197,6 +8211,22 @@ async def pb_stream(
     season: int = Query(1, ge=0),
     episode: int = Query(1, ge=0),
     title: Optional[str] = Query(None),
+):
+    if _pb_stream_inflight[0] >= _PB_STREAM_MAX_CONCURRENT:
+        raise HTTPException(503, "Too many concurrent stream resolves, try again shortly")
+    _pb_stream_inflight[0] += 1
+    try:
+        return await _pb_stream_impl(tmdb_id, type, season, episode, title)
+    finally:
+        _pb_stream_inflight[0] -= 1
+
+
+async def _pb_stream_impl(
+    tmdb_id: int,
+    type: str,
+    season: int,
+    episode: int,
+    title: Optional[str],
 ):
     """
     Multi-server stream list (embed + toon-stream resolver when available).
