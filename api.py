@@ -120,6 +120,34 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RateLimitMiddleware)
 
+# ── Scheduled self-restart ──────────────────────────────────────────────────
+# Three targeted fixes (reusing the wasmtime Engine, per-IP/subnet rate
+# limiting, capping /pb/stream concurrency) each addressed a real, verified
+# issue, but none stopped Render's recurring OOM kills (512Mi limit) --
+# memory keeps climbing over hours until it's killed, on an interval that
+# tracks request volume (as short as ~34 min under load) rather than wall
+# clock time or concurrent load, which rules out what's been tried so far
+# and points at something not yet found in this 10k-line file.
+#
+# Rather than let that keep happening on Render's unpredictable schedule --
+# where an OOM kill can land mid-request -- this exits the process on its
+# own timer, safely ahead of the shortest interval observed (~34 min), so
+# Render's existing restart-on-exit behavior (the same mechanism that
+# already brings it back after an OOM kill, confirmed recovering in
+# ~15-30s) recycles it on a predictable cadence instead. This does not fix
+# the underlying leak -- it bounds its damage to a short, controlled
+# restart instead of an unpredictable one.
+_SELF_RESTART_AFTER_S = 20 * 60
+
+
+@app.on_event("startup")
+async def _schedule_self_restart():
+    async def _restart_after_delay():
+        await asyncio.sleep(_SELF_RESTART_AFTER_S)
+        os._exit(0)
+    asyncio.create_task(_restart_after_delay())
+
+
 # ── Generic download relay ──────────────────────────────────────────────────
 # Some resolved download_url values (Wootly/Goojara mirrors, and likely others)
 # come back signed per-requester — they 403 no matter what Referer/User-Agent
